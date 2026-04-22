@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>🚕 Taxi Driver 3D — Final</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial;}
+  #gameCanvas{display:block;}
+  #hud{position:absolute;inset:0;pointer-events:none;}
+  #topBar{
+    position:absolute;left:0;right:0;top:0;
+    padding:10px 16px;display:flex;align-items:center;justify-content:space-between;
+    background:linear-gradient(180deg,rgba(0,0,0,.92),rgba(0,0,0,.55));
+    border-bottom:3px solid #FFD700;color:#fff;
+  }
+  #title{font-weight:900;letter-spacing:2px;color:#FFD700;text-shadow:0 0 14px #ff8800;font-size:18px}
+  .stat{min-width:140px;text-align:center}
+  .stat .v{font-size:20px;font-weight:900;color:#FFD700;text-shadow:0 0 10px #ff8800}
+  .stat .l{font-size:11px;color:#aaa;letter-spacing:2px;text-transform:uppercase}
+  #message{
+    position:absolute;top:62px;left:50%;transform:translateX(-50%);
+    background:rgba(0,0,0,.85);border:2px solid #FFD700;border-radius:999px;
+    padding:8px 16px;color:#fff;white-space:nowrap;
+    box-shadow:0 0 18px rgba(255,215,0,.25);font-size:14px
+  }
+  #minimap{
+    position:absolute;right:16px;bottom:16px;
+    width:230px;height:230px;
+    border:3px solid #FFD700;border-radius:10px;
+    box-shadow:0 0 20px rgba(255,215,0,.45);
+    background:#111;
+  }
+  #controls{
+    position:absolute;left:16px;bottom:16px;
+    background:rgba(0,0,0,.82);border:1px solid #444;border-radius:12px;
+    padding:12px 14px;color:#fff;font-size:13px;line-height:2;
+  }
+  #controls b{color:#FFD700;}
+  #errorBox{
+    position:absolute;left:12px;right:12px;top:100px;
+    background:rgba(80,0,0,.92);border:2px solid #ff3b3b;border-radius:10px;
+    padding:10px 12px;color:#ffd0d0;font:12px/1.4 ui-monospace,Consolas,monospace;
+    display:none;white-space:pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<div id="hud">
+  <div id="topBar">
+    <div class="stat">
+      <div class="v" id="scoreVal">R$ 0</div>
+      <div class="l">Dinheiro</div>
+    </div>
+    <div id="title">🚕 TAXI DRIVER 3D</div>
+    <div class="stat">
+      <div class="v"><span id="passVal">0</span> / <span id="corrVal">0</span></div>
+      <div class="l">Entregues / Corridas</div>
+    </div>
+  </div>
+
+  <div id="message">🟢 Pegue o passageiro verde!</div>
+
+  <div id="controls">
+    <b>W/↑</b> acelerar &nbsp; <b>S/↓</b> ré/frear<br>
+    <b>A/←</b> esquerda &nbsp; <b>D/→</b> direita
+  </div>
+
+  <canvas id="minimap" width="230" height="230"></canvas>
+  <div id="errorBox"></div>
+</div>
+
+<script>
+/* Loader do Three.js com fallback (evita “tela preta” por CDN bloqueado) */
+(function(){
+  const urls = [
+    "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js",
+    "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js",
+    "https://unpkg.com/three@0.128.0/build/three.min.js"
+  ];
+
+  const errorBox = document.getElementById('errorBox');
+  function showErr(msg){
+    errorBox.style.display = 'block';
+    errorBox.textContent = msg;
+  }
+
+  window.addEventListener('error', (e) => {
+    const where = e.filename ? (e.filename + ":" + e.lineno + ":" + e.colno) : "";
+    showErr("ERRO JS:\n" + (e.message || e.error || "Erro desconhecido") + (where ? "\n" + where : ""));
+  });
+
+  function loadScript(url){
+    return new Promise((resolve, reject)=>{
+      const s = document.createElement("script");
+      s.src = url;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Falha ao carregar: " + url));
+      document.head.appendChild(s);
+    });
+  }
+
+  (async()=>{
+    for (const u of urls){
+      try{
+        await loadScript(u);
+        if (window.THREE) break;
+      }catch(err){}
+    }
+    if (!window.THREE){
+      showErr("Não consegui carregar o Three.js.\n(sem internet ou CDN bloqueado)");
+      return;
+    }
+    initGame();
+  })();
+
+  function initGame(){
+    try{
+      // ─────────────────────────────────────────────
+      // CONSTANTES DA CIDADE
+      // ─────────────────────────────────────────────
+      const GRID  = 6;
+      const ROAD  = 26;
+      const BLOCK = 66;
+      const CELL  = BLOCK + ROAD;
+      const CITY  = GRID * CELL + ROAD;
+      const HALF  = CITY / 2;
+
+      const RIVER_W   = 42;                  // rio “fora” da cidade
+      const MAP_WORLD = CITY + RIVER_W * 2;  // minimapa cobre cidade + rio
+
+      // Táxi (AABB aproximado em XZ)
+      const TAXI_HW = 2.5;
+      const TAXI_HD = 4.8;
+
+      // Colisão NPC (círculo)
+      const NPC_RADIUS = 5.5;
+
+      // ─────────────────────────────────────────────
+      // RENDERER / SCENE / CAMERA
+      // ─────────────────────────────────────────────
+      const canvas = document.getElementById("gameCanvas");
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87CEEB);
+      scene.fog = new THREE.FogExp2(0x87CEEB, 0.0022);
+
+      const camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 1600);
+
+      // Luzes
+      scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+      const sun = new THREE.DirectionalLight(0xfff8e7, 1.15);
+      sun.position.set(240, 340, 160);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      Object.assign(sun.shadow.camera, { near:1, far:1200, left:-650, right:650, top:650, bottom:-650 });
+      scene.add(sun);
+      scene.add(new THREE.HemisphereLight(0x87CEEB, 0x445544, 0.42));
+
+      // ─────────────────────────────────────────────
+      // COLISORES (AABB em XZ)
+      // ─────────────────────────────────────────────
+      const buildingAABBs = [];
+      const lampAABBs = [];
+
+      function addAABB(list, cx, cz, hw, hd){
+        list.push({ minX:cx-hw, maxX:cx+hw, minZ:cz-hd, maxZ:cz+hd });
+      }
+
+      function aabbHitsTaxi(list, x, z){
+        const tx0 = x - TAXI_HW, tx1 = x + TAXI_HW;
+        const tz0 = z - TAXI_HD, tz1 = z + TAXI_HD;
+        for (const c of list){
+          if (tx1 > c.minX && tx0 < c.maxX && tz1 > c.minZ && tz0 < c.maxZ) return true;
+        }
+        return false;
+      }
+
+      // ─────────────────────────────────────────────
+      // CHÃO + RIO + MURO (visual)
+      // ─────────────────────────────────────────────
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(MAP_WORLD + 220, MAP_WORLD + 220),
+        new THREE.MeshLambertMaterial({ color:0x484848 })
+      );
+      ground.rotation.x = -Math.PI/2;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // Rio em 4 faixas ao redor
+      const riverMat = new THREE.MeshLambertMaterial({ color:0x1a6fa8, transparent:true, opacity:0.88 });
+      const riverDefs = [
+        [0,  HALF + RIVER_W/2,  CITY + RIVER_W*2, RIVER_W],
+        [0, -HALF - RIVER_W/2,  CITY + RIVER_W*2, RIVER_W],
+        [ HALF + RIVER_W/2, 0,  RIVER_W, CITY],
+        [-HALF - RIVER_W/2, 0,  RIVER_W, CITY],
+      ];
+      for (const [cx,cz,w,d] of riverDefs){
+        const r = new THREE.Mesh(new THREE.PlaneGeometry(w, d), riverMat);
+        r.rotation.x = -Math.PI/2;
+        r.position.set(cx, 0.06, cz);
+        scene.add(r);
+      }
+
+      // Alguns trechos de muro (visual)
+      const wallMat = new THREE.MeshLambertMaterial({ color:0x8b7355 });
+      const walls = [
+        { x:0, z: HALF + RIVER_W + 12, w: CITY*0.9, h: 12, d: 4 },
+        { x:HALF + RIVER_W + 12, z:0, w: 4, h: 12, d: CITY*0.6 },
+        { x:-HALF - RIVER_W - 12, z: HALF*0.1, w: 4, h: 12, d: CITY*0.5 },
+      ];
+      for (const wc of walls){
+        const m = new THREE.Mesh(new THREE.BoxGeometry(wc.w,wc.h,wc.d), wallMat);
+        m.position.set(wc.x, wc.h/2, wc.z);
+        m.castShadow = true; m.receiveShadow = true;
+        scene.add(m);
+      }
+
+      // ─────────────────────────────────────────────
+      // QUARTEIRÕES (calçada + grama)
+      // ─────────────────────────────────────────────
+      const sidewalkMat = new THREE.MeshLambertMaterial({ color:0xccbbaa });
+      const grassMat    = new THREE.MeshLambertMaterial({ color:0x4a8c3f });
+
+      for (let gx=0; gx<GRID; gx++){
+        for (let gz=0; gz<GRID; gz++){
+          const cx = ROAD + gx*CELL - HALF + BLOCK/2;
+          const cz = ROAD + gz*CELL - HALF + BLOCK/2;
+
+          const sw = new THREE.Mesh(new THREE.PlaneGeometry(BLOCK+4, BLOCK+4), sidewalkMat);
+          sw.rotation.x = -Math.PI/2; sw.position.set(cx, 0.012, cz); sw.receiveShadow = true;
+          scene.add(sw);
+
+          const gr = new THREE.Mesh(new THREE.PlaneGeometry(BLOCK-2, BLOCK-2), grassMat);
+          gr.rotation.x = -Math.PI/2; gr.position.set(cx, 0.02, cz); gr.receiveShadow = true;
+          scene.add(gr);
+        }
+      }
+
+      // Faixas pontilhadas (simples)
+      const lineMat = new THREE.MeshLambertMaterial({ color:0xeeee55 });
+      function addDash(x,z,rot){
+        const m = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 7.5), lineMat);
+        m.rotation.x=-Math.PI/2; m.rotation.z=rot||0;
+        m.position.set(x, 0.03, z);
+        scene.add(m);
+      }
+      for (let ix=0; ix<=GRID; ix++){
+        const rx = ROAD/2 + ix*CELL - HALF;
+        for (let s=0; s<GRID*5; s++) addDash(rx, -HALF + s*13 + 6, 0);
+      }
+      for (let iz=0; iz<=GRID; iz++){
+        const rz = ROAD/2 + iz*CELL - HALF;
+        for (let s=0; s<GRID*5; s++) addDash(-HALF + s*13 + 6, rz, Math.PI/2);
+      }
+
+      // ─────────────────────────────────────────────
+      // INTERSEÇÕES
+      // ─────────────────────────────────────────────
+      const intersections = [];
+      for (let ix=0; ix<=GRID; ix++){
+        for (let iz=0; iz<=GRID; iz++){
+          intersections.push(new THREE.Vector3(
+            ROAD/2 + ix*CELL - HALF, 0,
+            ROAD/2 + iz*CELL - HALF
+          ));
+        }
+      }
+      function randomIntersection(exclude){
+        const pts = intersections.filter(p => !exclude || p.distanceTo(exclude) > 80);
+        const arr = pts.length ? pts : intersections;
+        return arr[Math.floor(Math.random()*arr.length)].clone();
+      }
+
+      // ─────────────────────────────────────────────
+      // PRÉDIOS (100% dentro do quarteirão)
+      // ─────────────────────────────────────────────
+      const bColors = [0x8899bb,0xcc9966,0x7a9988,0xaaaacc,0x998877,0x7788aa,0xcc9988,0x889977,0x99aa88,0xaa8899];
+      const winMat  = new THREE.MeshLambertMaterial({ color:0xaaddff, emissive:0x2255aa, emissiveIntensity:0.45, transparent:true, opacity:0.82 });
+      const winDark = new THREE.MeshLambertMaterial({ color:0x223344, transparent:true, opacity:0.70 });
+
+      for (let gx=0; gx<GRID; gx++){
+        for (let gz=0; gz<GRID; gz++){
+          const bkCX = ROAD + gx*CELL - HALF + BLOCK/2;
+          const bkCZ = ROAD + gz*CELL - HALF + BLOCK/2;
+
+          // bloco dividido em 2x2 “lotes”
+          const cellSz = BLOCK/2;
+          const margin = 5; // garante que não invade calçada/rua
+          const offsets = [
+            [-cellSz/2, -cellSz/2],
+            [ cellSz/2, -cellSz/2],
+            [-cellSz/2,  cellSz/2],
+            [ cellSz/2,  cellSz/2],
+          ];
+
+          for (const [ox,oz] of offsets){
+            const maxBW = cellSz - margin*2;
+            const bw = maxBW * (0.55 + Math.random()*0.40);
+            const bd = maxBW * (0.55 + Math.random()*0.40);
+            const bh = 14 + Math.random()*55;
+
+            const px = bkCX + ox;
+            const pz = bkCZ + oz;
+
+            const col = bColors[Math.floor(Math.random()*bColors.length)];
+            const bld = new THREE.Mesh(
+              new THREE.BoxGeometry(bw, bh, bd),
+              new THREE.MeshLambertMaterial({ color:col })
+            );
+            bld.position.set(px, bh/2, pz);
+            bld.castShadow=true; bld.receiveShadow=true;
+            scene.add(bld);
+
+            // colisão do prédio
+            addAABB(buildingAABBs, px, pz, bw/2 + 0.6, bd/2 + 0.6);
+
+            // janelas (somente uma face, pra ficar leve)
+            const wrows = Math.max(2, Math.floor(bh/7));
+            const wcols = Math.max(2, Math.floor(bw/5));
+            for (let r=0; r<wrows; r++){
+              for (let c=0; c<wcols; c++){
+                const wm = new THREE.Mesh(
+                  new THREE.PlaneGeometry(1.4, 1.9),
+                  (Math.random() > 0.45) ? winMat : winDark
+                );
+                wm.position.set(
+                  px - bw/2 + 2 + c*((bw-3)/Math.max(wcols-1,1)),
+                  bh*0.08 + r*(bh*0.82/Math.max(wrows-1,1)),
+                  pz + bd/2 + 0.05
+                );
+                scene.add(wm);
+              }
+            }
+          }
+        }
+      }
+
+      // ─────────────────────────────────────────────
+      // POSTES (só na calçada) + colisão
+      // ─────────────────────────────────────────────
+      const poleMat = new THREE.MeshLambertMaterial({ color:0x555566 });
+      const glowMat = new THREE.MeshLambertMaterial({ color:0xffffaa, emissive:0xffee55, emissiveIntensity:1.0 });
+
+      function addLamp(x,z){
+        const g = new THREE.Group();
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.18,0.22,8,6), poleMat);
+        pole.position.y=4; g.add(pole);
+        const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.1,3,4), poleMat);
+        arm.rotation.z=Math.PI/2; arm.position.set(1.5,8.2,0); g.add(arm);
+        const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.38,8,8), glowMat);
+        bulb.position.set(3,7.8,0); g.add(bulb);
+        const pl = new THREE.PointLight(0xffeeaa, 0.5, 24);
+        pl.position.set(3,7.5,0); g.add(pl);
+        g.position.set(x,0,z);
+        scene.add(g);
+
+        // colisão do poste (base)
+        addAABB(lampAABBs, x, z, 0.85, 0.85);
+      }
+
+      for (let gx=0; gx<GRID; gx++){
+        for (let gz=0; gz<GRID; gz++){
+          const bkCX = ROAD + gx*CELL - HALF + BLOCK/2;
+          const bkCZ = ROAD + gz*CELL - HALF + BLOCK/2;
+          const edge = BLOCK/2 + 1.0; // garante que fica na calçada (não na rua)
+          addLamp(bkCX-edge, bkCZ-edge);
+          addLamp(bkCX+edge, bkCZ-edge);
+          addLamp(bkCX-edge, bkCZ+edge);
+          addLamp(bkCX+edge, bkCZ+edge);
+        }
+      }
+
+      // ─────────────────────────────────────────────
+      // SEMÁFOROS (visual + ciclo)
+      // ─────────────────────────────────────────────
+      let tlPhase = 0, tlElapsed = 0;
+      const tlDur = [5, 1.2, 5, 1.2];
+      let hGreen = true;
+      const tlList = [];
+
+      function makeTrafficLight(x,z,rotY,axis){
+        const g = new THREE.Group();
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.2,0.2,7,6), poleMat);
+        pole.position.y=3.5; g.add(pole);
+        const box = new THREE.Mesh(new THREE.BoxGeometry(1.1,3.1,1.1), new THREE.MeshLambertMaterial({ color:0x222222 }));
+        box.position.y=8; g.add(box);
+
+        const mk = (c,e,y) => {
+          const mat = new THREE.MeshLambertMaterial({ color:c, emissive:e, emissiveIntensity:0 });
+          const s = new THREE.Mesh(new THREE.SphereGeometry(0.3,8,8), mat);
+          s.position.set(0,y,0.57); g.add(s);
+          return mat;
+        };
+        const rM = mk(0xff2200,0xff0000,9.1);
+        const yM = mk(0x665500,0xffaa00,8.0);
+        const gM = mk(0x005500,0x00ff00,6.9);
+
+        g.position.set(x,0,z); g.rotation.y=rotY;
+        scene.add(g);
+        tlList.push({ rM,yM,gM,axis });
+      }
+
+      for (let ix=0; ix<=GRID; ix++){
+        for (let iz=0; iz<=GRID; iz++){
+          const rx = ROAD/2 + ix*CELL - HALF;
+          const rz = ROAD/2 + iz*CELL - HALF;
+          const sw = ROAD*0.44;
+          makeTrafficLight(rx+sw, rz-sw, 0, 'h');
+          makeTrafficLight(rx-sw, rz+sw, Math.PI, 'h');
+          makeTrafficLight(rx+sw, rz+sw, Math.PI/2, 'v');
+          makeTrafficLight(rx-sw, rz-sw, -Math.PI/2, 'v');
+        }
+      }
+
+      function updateTrafficLights(dt){
+        tlElapsed += dt;
+        if (tlElapsed >= tlDur[tlPhase]){ tlElapsed = 0; tlPhase = (tlPhase+1)%4; }
+        hGreen = (tlPhase === 0);
+
+        for (const tl of tlList){
+          const isH = tl.axis === 'h';
+          const green  = (isH && tlPhase===0) || (!isH && tlPhase===2);
+          const yellow = (isH && tlPhase===1) || (!isH && tlPhase===3);
+          const red    = !green && !yellow;
+
+          tl.rM.emissiveIntensity = red ? 1 : 0.06;
+          tl.yM.emissiveIntensity = yellow ? 1 : 0.06;
+          tl.gM.emissiveIntensity = green ? 1 : 0.06;
+        }
+      }
+
+      // ─────────────────────────────────────────────
+      // FUNÇÃO DE CARRO
+      // ─────────────────────────────────────────────
+      function buildCar(color, isPlayer){
+        const g = new THREE.Group();
+        const bodyMat  = new THREE.MeshLambertMaterial({ color });
+        const glassMat = new THREE.MeshLambertMaterial({ color:0x99ccff, transparent:true, opacity:0.58 });
+        const bumpMat  = new THREE.MeshLambertMaterial({ color:0x888888 });
+        const wMat     = new THREE.MeshLambertMaterial({ color:0x1a1a1a });
+        const rimMat   = new THREE.MeshLambertMaterial({ color:0xcccccc });
+
+        const body = new THREE.Mesh(new THREE.BoxGeometry(4.3,1.5,8.8), bodyMat);
+        body.position.y=1.3; body.castShadow=true; g.add(body);
+
+        const cab = new THREE.Mesh(new THREE.BoxGeometry(3.8,1.2,4.5), bodyMat);
+        cab.position.set(0,2.65,0.2); cab.castShadow=true; g.add(cab);
+
+        const fb = new THREE.Mesh(new THREE.BoxGeometry(4.1,0.45,0.35), bumpMat);
+        fb.position.set(0,0.7,4.55); g.add(fb);
+        const rb = fb.clone(); rb.position.z=-4.55; g.add(rb);
+
+        const fg = new THREE.Mesh(new THREE.BoxGeometry(3.5,1.0,0.1), glassMat);
+        fg.position.set(0,2.2,2.38); g.add(fg);
+        const bg = fg.clone(); bg.position.z=-2.1; g.add(bg);
+
+        const sg1 = new THREE.Mesh(new THREE.BoxGeometry(0.1,0.9,4.3), glassMat);
+        sg1.position.set( 1.95,2.2,0.2); g.add(sg1);
+        const sg2 = sg1.clone(); sg2.position.x=-1.95; g.add(sg2);
+
+        const wheels = [];
+        [[-2.3,0.72,3.1],[2.3,0.72,3.1],[-2.3,0.72,-3.1],[2.3,0.72,-3.1]].forEach(p=>{
+          const wg = new THREE.Group();
+          const tire = new THREE.Mesh(new THREE.CylinderGeometry(0.88,0.88,0.58,14), wMat);
+          tire.rotation.z=Math.PI/2; wg.add(tire);
+          const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.46,0.46,0.62,8), rimMat);
+          rim.rotation.z=Math.PI/2; wg.add(rim);
+          wg.position.set(...p); wg.castShadow=true;
+          g.add(wg); wheels.push(wg);
+        });
+
+        if (isPlayer){
+          const signMat = new THREE.MeshLambertMaterial({ color:0xffffff, emissive:0xffff88, emissiveIntensity:0.7 });
+          const sign = new THREE.Mesh(new THREE.BoxGeometry(1.8,0.55,1.0), signMat);
+          sign.position.set(0,3.42,0.2); g.add(sign);
+        }
+
+        return { group:g, wheels };
+      }
+
+      // ─────────────────────────────────────────────
+      // NPC CARS
+      // ─────────────────────────────────────────────
+      const npcCars = [];
+      const NPC_COLS = [0xff4444,0x4488ff,0x44cc44,0xff8844,0xcc44cc,0x44cccc,0xffffff,0x884444,0x88cc44,0x4444cc,0xff6688,0x88ff66];
+      const NUM_NPC = 14;
+      const angleByDir = [Math.PI/2, -Math.PI/2, 0, Math.PI];
+
+      function nextInterDir(pos, dir){
+        let best=null, bestD=Infinity;
+        for (const p of intersections){
+          let ok=false;
+          if (dir===0 && Math.abs(p.z-pos.z)<3 && p.x>pos.x+2) ok=true;
+          if (dir===1 && Math.abs(p.z-pos.z)<3 && p.x<pos.x-2) ok=true;
+          if (dir===2 && Math.abs(p.x-pos.x)<3 && p.z>pos.z+2) ok=true;
+          if (dir===3 && Math.abs(p.x-pos.x)<3 && p.z<pos.z-2) ok=true;
+          if (ok){
+            const d = pos.distanceTo(p);
+            if (d<bestD){ bestD=d; best=p.clone(); }
+          }
+        }
+        return best;
+      }
+
+      function pickDirWithNext(pos){
+        const dirs = [0,1,2,3].filter(d => nextInterDir(pos,d));
+        return dirs.length ? dirs[Math.floor(Math.random()*dirs.length)] : 0;
+      }
+
+      for (let i=0;i<NUM_NPC;i++){
+        const {group,wheels} = buildCar(NPC_COLS[i%NPC_COLS.length], false);
+
+        const si = intersections[Math.floor(Math.random()*intersections.length)].clone();
+        let dir = Math.floor(Math.random()*4);
+        const pos = si.clone();
+
+        // desloca para “faixa” (evita ficar exatamente no centro do cruzamento)
+        if (dir===0||dir===1) pos.z += ROAD*0.22*(dir===0?1:-1);
+        else                 pos.x += ROAD*0.22*(dir===2?-1:1);
+
+        dir = pickDirWithNext(pos);
+
+        group.position.copy(pos);
+        group.rotation.y = angleByDir[dir];
+        scene.add(group);
+
+        npcCars.push({
+          group, wheels,
+          pos: pos.clone(),
+          dir,
+          angle: angleByDir[dir],
+          nextInter: nextInterDir(pos,dir),
+          speed: 0.16 + Math.random()*0.12
+        });
+      }
+
+      // ─────────────────────────────────────────────
+      // PLAYER
+      // ─────────────────────────────────────────────
+      const player = buildCar(0xFFD700, true);
+      scene.add(player.group);
+
+      const taxiPos = new THREE.Vector3(0,0,0);
+      let taxiSpeed = 0;
+      let taxiAngle = 0;
+
+      // ─────────────────────────────────────────────
+      // PASSAGEIRO / DESTINO
+      // ─────────────────────────────────────────────
+      function makeMarker(color){
+        const g = new THREE.Group();
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55,0.55,1.9,10), new THREE.MeshLambertMaterial({color}));
+        body.position.y=1; g.add(body);
+        const head = new THREE.Mesh(new THREE.SphereGeometry(0.55,10,10), new THREE.MeshLambertMaterial({color:0xffcc88}));
+        head.position.y=2.55; g.add(head);
+        const arrow = new THREE.Mesh(new THREE.ConeGeometry(1.1,2.2,8), new THREE.MeshLambertMaterial({color, emissive:color, emissiveIntensity:0.55}));
+        arrow.position.y=6.5; g.add(arrow);
+        const ring = new THREE.Mesh(new THREE.RingGeometry(3.5,5,32), new THREE.MeshLambertMaterial({color, side:THREE.DoubleSide, transparent:true, opacity:0.65}));
+        ring.rotation.x=-Math.PI/2; ring.position.y=0.05; g.add(ring);
+        return { g, arrow, ring };
+      }
+
+      const passM = makeMarker(0x00ff66);
+      scene.add(passM.g);
+
+      const destM = (() => {
+        const g = new THREE.Group();
+        const pad = new THREE.Mesh(new THREE.CylinderGeometry(4,4,0.25,24), new THREE.MeshLambertMaterial({color:0xff3333, emissive:0xaa0000, emissiveIntensity:0.5}));
+        pad.position.y=0.12; g.add(pad);
+        const ring = new THREE.Mesh(new THREE.RingGeometry(5,6.5,24), new THREE.MeshLambertMaterial({color:0xff4444, side:THREE.DoubleSide, transparent:true, opacity:0.8}));
+        ring.rotation.x=-Math.PI/2; ring.position.y=0.05; g.add(ring);
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.2,0.2,8,8), new THREE.MeshLambertMaterial({color:0xff2222}));
+        pole.position.y=4.1; g.add(pole);
+        const flag = new THREE.Mesh(new THREE.BoxGeometry(3.2,2,0.1), new THREE.MeshLambertMaterial({color:0xff2222, emissive:0x880000, emissiveIntensity:0.4}));
+        flag.position.set(1.6,8.4,0); g.add(flag);
+        return { g, ring, flag };
+      })();
+      scene.add(destM.g);
+      destM.g.visible = false;
+
+      // ─────────────────────────────────────────────
+      // HUD STATE (ordem correta!)
+      // ─────────────────────────────────────────────
+      let score=0, delivered=0, races=0;
+      let hasPassenger=false;
+      let passengerPos = new THREE.Vector3();
+      let destPos = new THREE.Vector3();
+
+      function spawnPassenger(){
+        passengerPos = randomIntersection(null);
+        passM.g.position.set(passengerPos.x,0,passengerPos.z);
+        passM.g.visible=true;
+        destM.g.visible=false;
+        hasPassenger=false;
+
+        races++;
+        document.getElementById("corrVal").textContent = races;
+        document.getElementById("message").textContent = "🟢 Pegue o passageiro verde!";
+      }
+
+      // ─────────────────────────────────────────────
+      // COLISÃO (player)
+      // ─────────────────────────────────────────────
+      function taxiHitsNPC(x,z){
+        for (const c of npcCars){
+          const d = Math.hypot(x - c.pos.x, z - c.pos.z);
+          if (d < NPC_RADIUS) return true;
+        }
+        return false;
+      }
+
+      function hitsCityBounds(x,z){
+        // carro NÃO entra no rio -> trava no limite da cidade
+        return (x < -HALF+2 || x > HALF-2 || z < -HALF+2 || z > HALF-2);
+      }
+
+      function checkCollision(nx,nz){
+        if (hitsCityBounds(nx,nz)) return true;
+        if (aabbHitsTaxi(buildingAABBs, nx, nz)) return true;
+        if (aabbHitsTaxi(lampAABBs, nx, nz)) return true;
+        if (taxiHitsNPC(nx,nz)) return true;
+        return false;
+      }
+
+      // ─────────────────────────────────────────────
+      // SPAWN SEGURO DO TÁXI (NÃO nasce em poste)
+      // ─────────────────────────────────────────────
+      function placeTaxiSafely(){
+        for (let i=0; i<400; i++){
+          const base = intersections[Math.floor(Math.random()*intersections.length)].clone();
+          const pos = base.clone();
+
+          // escolhe “faixa” horizontal ou vertical
+          if (Math.random() < 0.5){
+            pos.z += (Math.random()<0.5 ? 1 : -1) * ROAD * 0.22;
+            taxiAngle = 0; // +Z
+          } else {
+            pos.x += (Math.random()<0.5 ? 1 : -1) * ROAD * 0.22;
+            taxiAngle = Math.PI/2; // +X
+          }
+
+          if (!checkCollision(pos.x, pos.z)){
+            taxiPos.copy(pos);
+            player.group.position.set(taxiPos.x,0,taxiPos.z);
+            player.group.rotation.y = taxiAngle;
+            taxiSpeed = 0;
+            return true;
+          }
+        }
+
+        // fallback (centro)
+        taxiPos.set(0,0,0);
+        taxiSpeed=0; taxiAngle=0;
+        return false;
+      }
+
+      let unstuckCooldown = 0;
+      function unstuckTaxiIfNeeded(dt){
+        unstuckCooldown = Math.max(0, unstuckCooldown - dt);
+        if (unstuckCooldown > 0) return;
+
+        if (checkCollision(taxiPos.x, taxiPos.z)){
+          placeTaxiSafely();
+          unstuckCooldown = 1.0;
+        }
+      }
+
+      // posiciona o táxi e cria a 1ª corrida
+      placeTaxiSafely();
+      spawnPassenger();
+
+      // ─────────────────────────────────────────────
+      // INPUT (somente teclas do jogo)
+      // ─────────────────────────────────────────────
+      const keys = {};
+      const KEYSET = new Set(["w","W","a","A","s","S","d","D","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"]);
+      addEventListener("keydown", (e)=>{
+        if (!KEYSET.has(e.key)) return;
+        keys[e.key] = true;
+        e.preventDefault();
+      });
+      addEventListener("keyup", (e)=>{
+        if (!KEYSET.has(e.key)) return;
+        keys[e.key] = false;
+      });
+
+      // ─────────────────────────────────────────────
+      // UPDATE NPCs
+      // ─────────────────────────────────────────────
+      function updateNPCs(){
+        for (const c of npcCars){
+          if (!c.nextInter) c.nextInter = nextInterDir(c.pos, c.dir);
+
+          const dist = c.nextInter ? c.pos.distanceTo(c.nextInter) : 0;
+
+          if (!c.nextInter || dist < 2.5){
+            c.pos.copy(c.nextInter || intersections[0]);
+            c.dir = pickDirWithNext(c.pos);
+            c.nextInter = nextInterDir(c.pos, c.dir);
+            c.angle = angleByDir[c.dir];
+          } else {
+            let stop=false;
+
+            // semáforo: eixo horizontal vs vertical
+            for (const inter of intersections){
+              const td = c.pos.distanceTo(inter);
+              if (td>2 && td<14){
+                if ((c.dir===0||c.dir===1) && !hGreen) { stop=true; break; }
+                if ((c.dir===2||c.dir===3) &&  hGreen) { stop=true; break; }
+              }
+            }
+
+            // evitar player
+            if (c.pos.distanceTo(taxiPos) < 10) stop = true;
+
+            if (!stop){
+              const to = new THREE.Vector3().subVectors(c.nextInter, c.pos).normalize();
+              c.pos.addScaledVector(to, c.speed);
+              for (const w of c.wheels) w.rotation.x += c.speed*0.6;
+            }
+          }
+
+          c.group.position.set(c.pos.x,0,c.pos.z);
+          c.group.rotation.y = c.angle;
+        }
+      }
+
+      // ─────────────────────────────────────────────
+      // MINIMAPA (frente do carro = “cima”)
+      // ─────────────────────────────────────────────
+      const mm = document.getElementById("minimap");
+      const mmCtx = mm.getContext("2d");
+      const MM = mm.width;
+      const MMS = MM / MAP_WORLD;
+      const MAP_OFF = HALF + RIVER_W;
+
+      function w2m(wx,wz){
+        const x = (wx + MAP_OFF) * MMS;
+        const y = (MAP_OFF - wz) * MMS; // +Z no mundo = sobe no mapa
+        return { x, y };
+      }
+
+      function drawMinimap(){
+        mmCtx.clearRect(0,0,MM,MM);
+
+        // fundo (rio)
+        mmCtx.fillStyle = "#1a6fa8";
+        mmCtx.fillRect(0,0,MM,MM);
+
+        // cidade (asfalto)
+        const cityTL = w2m(-HALF, HALF);
+        const citySz = CITY * MMS;
+        mmCtx.fillStyle = "#2e2e38";
+        mmCtx.fillRect(cityTL.x, cityTL.y, citySz, citySz);
+
+        // quarteirões (grama)
+        mmCtx.fillStyle = "#2d5a27";
+        for (let gx=0; gx<GRID; gx++){
+          for (let gz=0; gz<GRID; gz++){
+            const wx = ROAD + gx*CELL - HALF;
+            const wz = ROAD + gz*CELL - HALF;
+            const tl = w2m(wx, wz + BLOCK);
+            mmCtx.fillRect(tl.x, tl.y, BLOCK*MMS, BLOCK*MMS);
+          }
+        }
+
+        // NPCs
+        mmCtx.fillStyle = "#88aaff";
+        for (const c of npcCars){
+          const p = w2m(c.pos.x, c.pos.z);
+          mmCtx.beginPath(); mmCtx.arc(p.x,p.y,2.4,0,Math.PI*2); mmCtx.fill();
+        }
+
+        // linha para alvo
+        const tp = w2m(taxiPos.x, taxiPos.z);
+        const target = hasPassenger ? destPos : passengerPos;
+        const tg = w2m(target.x, target.z);
+        mmCtx.strokeStyle = hasPassenger ? "rgba(255,80,80,0.9)" : "rgba(0,255,100,0.9)";
+        mmCtx.lineWidth = 2; mmCtx.setLineDash([5,4]);
+        mmCtx.beginPath(); mmCtx.moveTo(tp.x,tp.y); mmCtx.lineTo(tg.x,tg.y); mmCtx.stroke();
+        mmCtx.setLineDash([]);
+
+        // alvo (P/D)
+        const ap = w2m(target.x, target.z);
+        mmCtx.fillStyle = hasPassenger ? "#ff4444" : "#00ff66";
+        mmCtx.beginPath(); mmCtx.arc(ap.x,ap.y,6,0,Math.PI*2); mmCtx.fill();
+        mmCtx.strokeStyle="#fff"; mmCtx.lineWidth=1.5; mmCtx.stroke();
+        mmCtx.fillStyle="#fff"; mmCtx.font="bold 9px Arial";
+        mmCtx.fillText(hasPassenger ? "D" : "P", ap.x-3.5, ap.y+3);
+
+        // ── SETA DO TÁXI (CORRIGIDA) ──
+        // Antes estava invertida. Agora: quando anda pra frente, aponta pra frente.
+        mmCtx.save();
+        mmCtx.translate(tp.x,tp.y);
+        mmCtx.rotate(taxiAngle); // ✅ (era -taxiAngle)
+        mmCtx.fillStyle="#FFD700";
+        mmCtx.strokeStyle="#885500";
+        mmCtx.lineWidth=1;
+        mmCtx.beginPath();
+        mmCtx.moveTo(0,-9);      // ponta pra cima
+        mmCtx.lineTo(6, 6);
+        mmCtx.lineTo(0, 3.5);
+        mmCtx.lineTo(-6,6);
+        mmCtx.closePath();
+        mmCtx.fill(); mmCtx.stroke();
+        mmCtx.restore();
+
+        mmCtx.strokeStyle="#FFD700"; mmCtx.lineWidth=2.5;
+        mmCtx.strokeRect(1,1,MM-2,MM-2);
+        mmCtx.fillStyle="#FFD700"; mmCtx.font="bold 11px Arial";
+        mmCtx.fillText("MAPA", 6, 16);
+      }
+
+      // ─────────────────────────────────────────────
+      // CAMERA
+      // ─────────────────────────────────────────────
+      const camCur  = new THREE.Vector3(0,18,-28);
+      const lookCur = new THREE.Vector3(0,2.5,0);
+
+      // ─────────────────────────────────────────────
+      // LOOP PRINCIPAL
+      // ─────────────────────────────────────────────
+      const MAX_SPD=0.56, ACCEL=0.022, FRICTION=0.935, TURN=0.032;
+      let tick=0, last=performance.now();
+
+      function frame(now){
+        requestAnimationFrame(frame);
+        const dt = Math.min((now-last)/1000, 0.05);
+        last = now;
+        tick += dt;
+
+        unstuckTaxiIfNeeded(dt);
+
+        const fwd = keys["w"]||keys["W"]||keys["ArrowUp"];
+        const bwd = keys["s"]||keys["S"]||keys["ArrowDown"];
+        const lft = keys["a"]||keys["A"]||keys["ArrowLeft"];
+        const rgt = keys["d"]||keys["D"]||keys["ArrowRight"];
+
+        if (fwd) taxiSpeed = Math.min(taxiSpeed + ACCEL, MAX_SPD);
+        else if (bwd) taxiSpeed = Math.max(taxiSpeed - ACCEL, -MAX_SPD*0.38);
+        else taxiSpeed *= FRICTION;
+
+        if (Math.abs(taxiSpeed) > 0.01){
+          if (lft) taxiAngle += TURN * Math.sign(taxiSpeed);
+          if (rgt) taxiAngle -= TURN * Math.sign(taxiSpeed);
+        }
+
+        const dx = Math.sin(taxiAngle) * taxiSpeed;
+        const dz = Math.cos(taxiAngle) * taxiSpeed;
+        const nx = taxiPos.x + dx;
+        const nz = taxiPos.z + dz;
+
+        if (checkCollision(nx,nz)){
+          taxiSpeed = 0;
+        } else {
+          taxiPos.x = nx;
+          taxiPos.z = nz;
+        }
+
+        player.group.position.set(taxiPos.x,0,taxiPos.z);
+        player.group.rotation.y = taxiAngle;
+        for (const w of player.wheels) w.rotation.x += taxiSpeed*0.6;
+
+        // animações markers
+        passM.g.position.y = Math.sin(tick*2)*0.4;
+        passM.arrow.rotation.y = tick*1.5;
+        passM.ring.rotation.y = tick;
+
+        destM.ring.rotation.y = tick*0.8;
+        destM.flag.rotation.y = Math.sin(tick*2)*0.18;
+
+        // pegar passageiro
+        if (!hasPassenger && passM.g.visible && taxiPos.distanceTo(passengerPos) < 10){
+          hasPassenger = true;
+          passM.g.visible = false;
+
+          destPos = randomIntersection(passengerPos);
+          destM.g.position.set(destPos.x,0,destPos.z);
+          destM.g.visible = true;
+
+          document.getElementById("message").textContent = "🔴 Leve o passageiro ao destino!";
+        }
+
+        // entregar
+        if (hasPassenger && destM.g.visible && taxiPos.distanceTo(destPos) < 11){
+          hasPassenger = false;
+          destM.g.visible = false;
+
+          delivered++;
+          const dist = Math.round(passengerPos.distanceTo(destPos));
+          const fare = 50 + Math.floor(dist*0.85) + Math.floor(Math.random()*60);
+          score += fare;
+
+          document.getElementById("scoreVal").textContent = "R$ " + score;
+          document.getElementById("passVal").textContent  = delivered;
+          document.getElementById("message").textContent  = "✅ Entregue! +R$ " + fare;
+
+          setTimeout(spawnPassenger, 2200);
+        }
+
+        updateTrafficLights(dt);
+        updateNPCs();
+
+        const camOffset = new THREE.Vector3(
+          Math.sin(taxiAngle)*-24,
+          14,
+          Math.cos(taxiAngle)*-24
+        );
+        camCur.lerp(taxiPos.clone().add(camOffset), 0.08);
+        camera.position.copy(camCur);
+        lookCur.lerp(new THREE.Vector3(taxiPos.x,2.5,taxiPos.z), 0.1);
+        camera.lookAt(lookCur);
+
+        drawMinimap();
+        renderer.render(scene, camera);
+      }
+
+      requestAnimationFrame(frame);
+
+      addEventListener("resize", ()=>{
+        renderer.setSize(innerWidth, innerHeight);
+        camera.aspect = innerWidth/innerHeight;
+        camera.updateProjectionMatrix();
+      });
+
+    } catch (err){
+      const errorBox = document.getElementById('errorBox');
+      errorBox.style.display = 'block';
+      errorBox.textContent = "EXCEÇÃO NO INIT:\n" + (err && err.stack ? err.stack : String(err));
+    }
+  }
+})();
+</script>
+</body>
+</html>
